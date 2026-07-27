@@ -1,0 +1,21 @@
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editor / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# FAR_spectro generated calibration sessions
+FAR_spectro_session_*/
+
+# Temporary files
+tempCodeRunnerFile.py
