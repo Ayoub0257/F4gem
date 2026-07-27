@@ -61,6 +61,11 @@ class FitsDocument:
     def __init__(self, path: str | Path):
         self.path = Path(path).expanduser().resolve()
         self.hdul: fits.HDUList | None = None
+        # Astropy cannot decode BSCALE/BZERO/BLANK data while the same HDU is
+        # backed by a strict memory map.  Keep the normal memory-mapped handle
+        # for ordinary images/tables and open this second handle lazily only
+        # when a scaled or compressed image is actually selected.
+        self._non_memmap_hdul: fits.HDUList | None = None
         self._descriptors: list[HDUDescriptor] = []
 
     @classmethod
@@ -198,7 +203,16 @@ class FitsDocument:
         hdu = self.hdu(index)
 
         if self._requires_section_access(hdu):
-            result = hdu.section[selection]
+            # ``ImageHDU.section`` still applies FITS scaling internally.  With
+            # a strict memory-mapped file Astropy deliberately rejects that
+            # conversion, producing:
+            #
+            #   Cannot load a memory-mapped image: BZERO/BSCALE/BLANK ...
+            #
+            # Use a lazily opened non-memmap handle for only these HDUs.  The
+            # section API reads just the requested 1D array or 2D plane, so an
+            # N-dimensional cube is not materialized in full.
+            result = self._non_memmap_hdu(index).section[selection]
         else:
             data = hdu.data
             if data is None:
@@ -207,14 +221,50 @@ class FitsDocument:
 
         return np.asanyarray(result)
 
+    def _non_memmap_hdu(self, index: int):
+        """Return an HDU from a lazily opened non-memory-mapped handle.
+
+        This handle is used only for scaled integer images and compressed image
+        HDUs.  Combined with ``HDU.section`` it preserves bounded-memory access:
+        only the requested selection is decoded.
+        """
+
+        self._validate_index(index)
+
+        if self._non_memmap_hdul is None:
+            try:
+                self._non_memmap_hdul = fits.open(
+                    self.path,
+                    mode="readonly",
+                    memmap=False,
+                    lazy_load_hdus=True,
+                    ignore_missing_end=True,
+                )
+            except Exception:
+                if self._non_memmap_hdul is not None:
+                    self._non_memmap_hdul.close()
+                    self._non_memmap_hdul = None
+                raise
+
+            assert self.hdul is not None
+            if len(self._non_memmap_hdul) != len(self.hdul):
+                self._non_memmap_hdul.close()
+                self._non_memmap_hdul = None
+                raise RuntimeError(
+                    "The FITS file changed while it was open; HDU counts no longer match."
+                )
+
+        return self._non_memmap_hdul[index]
+
     @staticmethod
     def _requires_section_access(hdu: Any) -> bool:
         """Return whether direct ``hdu.data`` access is unsuitable.
 
         ``hdu.data`` cannot remain memory-mapped when FITS integer storage must
-        be decoded through BSCALE/BZERO/BLANK.  The section interface performs
-        that decoding only for the requested slice.  It is also the efficient
-        path for internally tile-compressed images.
+        be decoded through BSCALE/BZERO/BLANK.  Such HDUs are read through a
+        separate non-memory-mapped handle plus Astropy's ``section`` interface,
+        which decodes only the requested slice.  The same path is used for
+        internally tile-compressed images.
         """
 
         if isinstance(hdu, fits.CompImageHDU):
@@ -299,9 +349,14 @@ class FitsDocument:
         return min(self._descriptors, key=preference).index
 
     def close(self) -> None:
+        if self._non_memmap_hdul is not None:
+            self._non_memmap_hdul.close()
+            self._non_memmap_hdul = None
+
         if self.hdul is not None:
             self.hdul.close()
             self.hdul = None
+
         self._descriptors = []
 
     def _inspect_hdus(self) -> list[HDUDescriptor]:

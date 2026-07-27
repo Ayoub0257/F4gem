@@ -9,9 +9,19 @@ class ImageDisplay(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.image_view = ImageView()
-        self.hist_visible = True
 
+        self.image_view = ImageView()
+
+        # FITS/NumPy images use the standard (row, column) convention:
+        #     array[y, x]
+        #
+        # PyQtGraph defaults to the older (column, row) convention, which makes
+        # normal 2D FITS arrays appear transposed/sideways. Configure only this
+        # ImageView to interpret the data as row-major. This changes the display
+        # transform without rotating or copying the pixel array.
+        self.image_view.getImageItem().setOpts(axisOrder="row-major")
+
+        self.hist_visible = True
         self.toggle_button = QPushButton("Hide Histogram")
         self.toggle_button.clicked.connect(self.toggle_histogram)
 
@@ -43,13 +53,16 @@ class ImageDisplay(QWidget):
 
         if np.ma.isMaskedArray(array):
             array = array.filled(np.nan)
+
         if np.iscomplexobj(array):
             array = np.abs(array)
 
         try:
             array = np.asarray(array, dtype=np.float32)
         except (TypeError, ValueError) as exc:
-            raise TypeError("The selected image does not contain numerical data.") from exc
+            raise TypeError(
+                "The selected image does not contain numerical data."
+            ) from exc
 
         finite = np.isfinite(array)
         if not finite.any():
