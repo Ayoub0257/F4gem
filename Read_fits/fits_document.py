@@ -14,6 +14,14 @@ from typing import Any, Iterable
 import numpy as np
 from astropy.io import fits
 
+from .coordinates import (
+    CelestialLineResult,
+    CoordinateProvider,
+    CoordinateResult,
+    PixelCoordinateResult,
+    build_fits_coordinate_provider,
+)
+
 
 IMAGE_HDU_TYPES = (
     fits.PrimaryHDU,
@@ -67,6 +75,9 @@ class FitsDocument:
         # when a scaled or compressed image is actually selected.
         self._non_memmap_hdul: fits.HDUList | None = None
         self._descriptors: list[HDUDescriptor] = []
+        # Coordinate providers are built only when a user inspects an image
+        # pixel, then reused for all later cursor movements on the same HDU.
+        self._coordinate_providers: dict[int, CoordinateProvider] = {}
 
     @classmethod
     def open(cls, path: str | Path) -> "FitsDocument":
@@ -135,6 +146,193 @@ class FitsDocument:
             sep="\n",
             endcard=False,
             padding=False,
+        )
+
+    def data_unit(self, index: int) -> str | None:
+        """Return the HDU's physical data unit from ``BUNIT`` when present."""
+
+        unit = str(self.header(index).get("BUNIT", "") or "").strip()
+        return unit or None
+
+    def coordinate_provider(self, index: int) -> CoordinateProvider:
+        """Return the cached coordinate provider for an image HDU."""
+
+        descriptor = self.descriptor(index)
+        if descriptor.category not in {"image_2d", "image_nd"}:
+            raise TypeError(
+                f"HDU {index} is not a 2D/N-D image; "
+                f"category={descriptor.category!r}."
+            )
+
+        provider = self._coordinate_providers.get(index)
+        if provider is not None:
+            return provider
+
+        shape = descriptor.shape
+        if shape is None:
+            raise ValueError(f"HDU {index} contains no image data.")
+
+        if self.hdul is None:
+            raise RuntimeError("The FITS document is closed.")
+
+        provider = build_fits_coordinate_provider(
+            header=self.header(index),
+            hdul=self.hdul,
+            data_shape=shape,
+        )
+        self._coordinate_providers[index] = provider
+        return provider
+
+    def world_at(
+        self,
+        index: int,
+        x: float,
+        y: float,
+        leading_indices: Iterable[int] = (),
+    ) -> CoordinateResult:
+        """Convert one displayed image pixel to physical world coordinates.
+
+        ``x`` and ``y`` are display/image coordinates.  They are converted to
+        NumPy order before calling the APE-14 WCS API:
+
+        ``(leading_axis_0, ..., y, x)``.
+        """
+
+        descriptor = self.descriptor(index)
+        if descriptor.category not in {"image_2d", "image_nd"}:
+            raise TypeError(
+                f"HDU {index} is not image data; category={descriptor.category!r}."
+            )
+
+        shape = descriptor.shape
+        if shape is None:
+            raise ValueError(f"HDU {index} contains no image data.")
+
+        indices = tuple(int(value) for value in leading_indices)
+        expected = len(shape) - 2
+        if len(indices) != expected:
+            raise ValueError(
+                f"Expected {expected} leading-axis indices for shape {shape}, "
+                f"received {len(indices)}."
+            )
+
+        for axis, (value, axis_size) in enumerate(zip(indices, shape[:-2])):
+            if not 0 <= value < axis_size:
+                raise IndexError(
+                    f"Index {value} is outside axis {axis} with size {axis_size}."
+                )
+
+        x_value = float(x)
+        y_value = float(y)
+        height, width = shape[-2:]
+        if not 0.0 <= x_value < float(width):
+            raise IndexError(f"X coordinate {x_value} is outside image width {width}.")
+        if not 0.0 <= y_value < float(height):
+            raise IndexError(f"Y coordinate {y_value} is outside image height {height}.")
+
+        array_indices = (
+            *(float(value) for value in indices),
+            y_value,
+            x_value,
+        )
+        return self.coordinate_provider(index).array_index_to_world(array_indices)
+
+    def has_celestial_wcs(self, index: int) -> bool:
+        """Return whether the selected image HDU defines both RA and Dec."""
+
+        return bool(self.coordinate_provider(index).has_celestial_coordinates)
+
+    def coordinate_frame_name(self, index: int) -> str:
+        """Return the equatorial frame label reported by the WCS provider."""
+
+        return str(self.coordinate_provider(index).frame_name or "Unknown")
+
+    def celestial_to_pixel(
+        self,
+        index: int,
+        *,
+        ra_deg: float,
+        dec_deg: float,
+        leading_indices: Iterable[int] = (),
+    ) -> PixelCoordinateResult:
+        """Map one RA/Dec position onto the currently selected image plane."""
+
+        descriptor = self.descriptor(index)
+        if descriptor.category not in {"image_2d", "image_nd"}:
+            raise TypeError(
+                f"HDU {index} is not image data; category={descriptor.category!r}."
+            )
+
+        shape = descriptor.shape
+        if shape is None:
+            raise ValueError(f"HDU {index} contains no image data.")
+
+        reference = self._reference_array_coordinates(shape, leading_indices)
+        return self.coordinate_provider(index).celestial_to_array_coordinates(
+            ra_deg=float(ra_deg),
+            dec_deg=float(dec_deg),
+            reference_array_indices=reference,
+            image_shape=shape,
+        )
+
+    def celestial_line(
+        self,
+        index: int,
+        *,
+        ra_deg: float | None = None,
+        dec_deg: float | None = None,
+        leading_indices: Iterable[int] = (),
+        samples: int = 192,
+    ) -> CelestialLineResult:
+        """Project a constant-RA or constant-Dec curve on the current plane."""
+
+        descriptor = self.descriptor(index)
+        if descriptor.category not in {"image_2d", "image_nd"}:
+            raise TypeError(
+                f"HDU {index} is not image data; category={descriptor.category!r}."
+            )
+
+        shape = descriptor.shape
+        if shape is None:
+            raise ValueError(f"HDU {index} contains no image data.")
+
+        reference = self._reference_array_coordinates(shape, leading_indices)
+        return self.coordinate_provider(index).celestial_line(
+            ra_deg=None if ra_deg is None else float(ra_deg),
+            dec_deg=None if dec_deg is None else float(dec_deg),
+            reference_array_indices=reference,
+            image_shape=shape,
+            samples=int(samples),
+        )
+
+    @staticmethod
+    def _reference_array_coordinates(
+        shape: tuple[int, ...],
+        leading_indices: Iterable[int],
+    ) -> tuple[float, ...]:
+        """Build a valid NumPy-order WCS reference on the current 2D plane."""
+
+        indices = tuple(int(value) for value in leading_indices)
+        expected = len(shape) - 2
+        if len(indices) != expected:
+            raise ValueError(
+                f"Expected {expected} leading-axis indices for shape {shape}, "
+                f"received {len(indices)}."
+            )
+
+        for axis, (value, axis_size) in enumerate(zip(indices, shape[:-2])):
+            if not 0 <= value < axis_size:
+                raise IndexError(
+                    f"Index {value} is outside axis {axis} with size {axis_size}."
+                )
+
+        height, width = shape[-2:]
+        center_y = max(0.0, (float(height) - 1.0) / 2.0)
+        center_x = max(0.0, (float(width) - 1.0) / 2.0)
+        return (
+            *(float(value) for value in indices),
+            center_y,
+            center_x,
         )
 
     def extract_2d_slice(
@@ -349,6 +547,10 @@ class FitsDocument:
         return min(self._descriptors, key=preference).index
 
     def close(self) -> None:
+        # WCS objects may retain distortion lookup arrays originating from the
+        # HDUList.  Drop providers before closing the underlying file handles.
+        self._coordinate_providers.clear()
+
         if self._non_memmap_hdul is not None:
             self._non_memmap_hdul.close()
             self._non_memmap_hdul = None

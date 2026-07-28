@@ -1,7 +1,7 @@
 """Regression tests for memory-efficient FITS image access.
 
 Run from the project root with:
-    python -m unittest tests.test_fits_document
+    python -m unittest -v tests.test_fits_document
 """
 
 from __future__ import annotations
@@ -58,8 +58,12 @@ class FitsDocumentImageAccessTests(unittest.TestCase):
         index = self._index("UINT16_2D")
         hdu = self.document.hdu(index)
         self.assertTrue(self.document._requires_section_access(hdu))
+        self.assertIsNone(self.document._non_memmap_hdul)
 
         actual = self.document.extract_2d_slice(index)
+
+        self.assertIsNotNone(self.document._non_memmap_hdul)
+        self.assertIsNotNone(self.document.hdul)
         self.assertEqual(actual.dtype, np.dtype(np.uint16))
         np.testing.assert_array_equal(actual, self.uint16_2d)
 
@@ -75,6 +79,21 @@ class FitsDocumentImageAccessTests(unittest.TestCase):
         index = self._index("UINT16_4D")
         with self.assertRaises(RuntimeError):
             self.document.data(index)
+
+    def test_close_releases_both_handles_and_coordinate_cache(self) -> None:
+        index = self._index("UINT16_2D")
+        self.document.extract_2d_slice(index)
+        self.document.coordinate_provider(index)
+
+        self.assertIsNotNone(self.document.hdul)
+        self.assertIsNotNone(self.document._non_memmap_hdul)
+        self.assertTrue(self.document._coordinate_providers)
+
+        self.document.close()
+
+        self.assertIsNone(self.document.hdul)
+        self.assertIsNone(self.document._non_memmap_hdul)
+        self.assertFalse(self.document._coordinate_providers)
 
 
 if __name__ == "__main__":
