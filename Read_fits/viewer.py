@@ -13,8 +13,8 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-
 from Spectro.spectrum_plot import SpectrumPlotWidget
+
 from .array_plot import FitsArrayPlot
 from .axis_selector import AxisSelector
 from .coordinate_panel import CoordinateMarker, CoordinatePanel
@@ -58,11 +58,11 @@ class FitsViewer(QWidget):
         super().__init__()
         self.setWindowTitle("Faraway//Spectroscopy")
         self.setAcceptDrops(True)
-
         self.path: str | None = None
         self.document: FitsDocument | None = None
         self.current_hdu_index: int | None = None
         self._header_visible = False
+        self._data_widget_before_header: QWidget | None = None
         self._pending_slice_indices: tuple[int, ...] = ()
         self.thread: QThread | None = None
         self.worker: FitsLoaderWorker | None = None
@@ -203,7 +203,6 @@ class FitsViewer(QWidget):
         if self.thread is not None and self.thread.isRunning():
             show_error(self, "A FITS file is already being loaded.")
             return
-
         if not path.lower().endswith((".fit", ".fits", ".fts")):
             show_error(self, "The selected file is not a FITS file.")
             return
@@ -214,7 +213,6 @@ class FitsViewer(QWidget):
         self.thread = QThread(self)
         self.worker = FitsLoaderWorker(path)
         self.worker.moveToThread(self.thread)
-
         self.thread.started.connect(self.worker.run)
         self.worker.finished.connect(self.on_fits_loaded)
         self.worker.error.connect(self.on_fits_error)
@@ -224,7 +222,6 @@ class FitsViewer(QWidget):
         self.worker.error.connect(self.worker.deleteLater)
         self.thread.finished.connect(self._on_loader_thread_finished)
         self.thread.finished.connect(self.thread.deleteLater)
-
         self.thread.start()
 
     def _on_loader_thread_finished(self) -> None:
@@ -237,6 +234,7 @@ class FitsViewer(QWidget):
         self.path = str(document.path)
         self.current_hdu_index = None
         self._header_visible = False
+        self._data_widget_before_header = None
         self._pending_slice_indices = ()
         self._coordinate_markers.clear()
         self._last_cursor_lookup = None
@@ -253,7 +251,6 @@ class FitsViewer(QWidget):
         self.header_button.setEnabled(True)
         self.show_1d_button.setEnabled(True)
         self.on_hdu_selected(preferred_index)
-
         self.stack.setCurrentWidget(self.document_container)
         self.drop_area.set_text("Drop a FITS file here...")
 
@@ -272,8 +269,11 @@ class FitsViewer(QWidget):
         self._slice_timer.stop()
         self.current_hdu_index = hdu_index
         self._header_visible = False
+        self._data_widget_before_header = None
         self._last_cursor_lookup = None
         self.header_button.setText("Show Header")
+        self.header_button.setEnabled(True)
+        self.axis_selector.setEnabled(True)
         self.image_display.clear_overlays()
         self.image_display.reset_contrast_state()
         self.coordinate_panel.replace_marker_list(
@@ -312,7 +312,15 @@ class FitsViewer(QWidget):
         elif descriptor.category == "table":
             self.axis_selector.clear()
             self._pending_slice_indices = ()
-            self.table_viewer.set_hdu(hdu)
+            self.table_viewer.set_hdu(
+                hdu,
+                suggested_filename=self._export_filename(
+                    descriptor.index,
+                    descriptor.name,
+                    "table",
+                    ".csv",
+                ),
+            )
             self.data_stack.setCurrentWidget(self.table_viewer)
 
         elif descriptor.category == "array_1d":
@@ -428,6 +436,7 @@ class FitsViewer(QWidget):
     def on_coordinate_format_changed(self, _format: str) -> None:
         if self._last_cursor_lookup is None:
             return
+
         x, y, value, result, data_unit = self._last_cursor_lookup
         self._display_cursor_lookup(
             x=x,
@@ -473,6 +482,7 @@ class FitsViewer(QWidget):
             return False, "No FITS image is selected."
 
         leading = self._current_leading_indices()
+
         if marker.kind == "point":
             assert marker.ra_deg is not None
             assert marker.dec_deg is not None
@@ -509,7 +519,11 @@ class FitsViewer(QWidget):
             or line_result.x_values is None
             or line_result.y_values is None
         ):
-            return False, line_result.message or "The coordinate line does not cross the image."
+            return (
+                False,
+                line_result.message
+                or "The coordinate line does not cross the image.",
+            )
 
         self.image_display.set_line_overlay(
             marker.marker_id,
@@ -537,42 +551,97 @@ class FitsViewer(QWidget):
     def _current_leading_indices(self) -> tuple[int, ...]:
         if self.document is None or self.current_hdu_index is None:
             return ()
+
         descriptor = self.document.descriptor(self.current_hdu_index)
         if descriptor.category == "image_nd":
             return self._pending_slice_indices
         return ()
 
     def toggle_header(self) -> None:
+        """Show or hide the header without re-rendering the selected data.
+
+        Returning from the header now restores the existing data widget directly.
+        This preserves the user's histogram levels, stretch, zoom and pan state.
+        """
+
         if self.document is None or self.current_hdu_index is None:
             return
 
         descriptor = self.document.descriptor(self.current_hdu_index)
+
         if self._header_visible and descriptor.category != "empty":
             self._header_visible = False
             self.header_button.setText("Show Header")
-            try:
-                self._display_selected_hdu(reset_axes=False)
-            except Exception as exc:
-                self._show_data_error(self.current_hdu_index, exc)
-        else:
-            self._show_header()
+            self.header_button.setEnabled(True)
+            self.axis_selector.setEnabled(True)
+
+            if self._data_widget_before_header is not None:
+                self.data_stack.setCurrentWidget(self._data_widget_before_header)
+                self._data_widget_before_header = None
+            else:
+                # Defensive fallback. In normal use a previous data widget is
+                # always stored before the header is shown.
+                try:
+                    self._display_selected_hdu(reset_axes=False)
+                except Exception as exc:
+                    self._show_data_error(self.current_hdu_index, exc)
+            return
+
+        self._show_header()
 
     def _show_header(self) -> None:
         if self.document is None or self.current_hdu_index is None:
             return
 
         self._slice_timer.stop()
+        descriptor = self.document.descriptor(self.current_hdu_index)
+
+        if descriptor.category == "empty":
+            self._data_widget_before_header = None
+        else:
+            current_widget = self.data_stack.currentWidget()
+            if current_widget is not self.header_viewer:
+                self._data_widget_before_header = current_widget
+
         self.header_viewer.set_header_text(
-            self.document.header_text(self.current_hdu_index)
+            self.document.header_text(self.current_hdu_index),
+            suggested_filename=self._export_filename(
+                descriptor.index,
+                descriptor.name,
+                "header",
+                ".txt",
+            ),
         )
         self.data_stack.setCurrentWidget(self.header_viewer)
         self._header_visible = True
+        self.axis_selector.setEnabled(False)
 
-        descriptor = self.document.descriptor(self.current_hdu_index)
         if descriptor.category == "empty":
             self.header_button.setText("Header Only")
+            self.header_button.setEnabled(False)
         else:
             self.header_button.setText("Back to Data")
+            self.header_button.setEnabled(True)
+
+    def _export_filename(
+        self,
+        hdu_index: int,
+        hdu_name: str,
+        content_name: str,
+        suffix: str,
+    ) -> str:
+        """Build a safe and informative default export filename."""
+
+        source_stem = Path(self.path).stem if self.path else "fits"
+        safe_hdu_name = "".join(
+            character if character.isalnum() or character in "-_" else "_"
+            for character in (hdu_name or "HDU")
+        ).strip("_")
+        safe_hdu_name = safe_hdu_name or "HDU"
+        return (
+            f"{source_stem}_HDU{hdu_index}_{safe_hdu_name}_{content_name}"
+            f"{suffix}"
+        )
 
     def _show_data_error(self, hdu_index: int, error: Exception) -> None:
         self.axis_selector.clear()
